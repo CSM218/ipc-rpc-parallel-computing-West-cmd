@@ -40,16 +40,20 @@ public class Master {
         }
     }
 
-    // Task representation
+    // Task representation with retry depth
     private static class Task {
         int requestId;
         byte[] payload;
         CompletableFuture<byte[]> future;
+        int retryCount;
+        int maxRetryDepth;
 
         Task(int requestId, byte[] payload, CompletableFuture<byte[]> future) {
             this.requestId = requestId;
             this.payload = payload;
             this.future = future;
+            this.retryCount = 0;
+            this.maxRetryDepth = 3; // Retry depth for fault tolerance
         }
     }
 
@@ -211,8 +215,16 @@ public class Master {
         } catch (IOException e) {
             System.err.println("[MASTER] Failed to send task to " + worker.workerId);
             worker.healthy = false;
-            // Reassign task for recovery
-            taskQueue.offer(task);
+            
+            // Reassign task with retry depth tracking
+            if (task.retryCount < task.maxRetryDepth) {
+                task.retryCount++;
+                System.out.println("[MASTER] Reassigning task " + task.requestId + " (attempt " + task.retryCount + "/" + task.maxRetryDepth + ")");
+                taskQueue.offer(task);
+            } else {
+                System.err.println("[MASTER] Task " + task.requestId + " exceeded retry depth, failing");
+                task.future.completeExceptionally(new Exception("Max retry depth exceeded"));
+            }
         }
     }
 
@@ -255,12 +267,12 @@ public class Master {
         }
     }
 
-    // Recovery mechanism
+    // Recovery mechanism with retry depth
     private void recoverWorker(WorkerConnection worker) {
         System.out.println("[MASTER] Recovering from worker failure: " + worker.workerId);
         workers.remove(worker.workerId);
         
-        // Reassign pending tasks
+        // Reassign pending tasks with retry attempt tracking
         List<Integer> failedRequests = new ArrayList<>();
         for (Map.Entry<Integer, CompletableFuture<byte[]>> entry : pendingRequests.entrySet()) {
             if (!entry.getValue().isDone()) {
@@ -271,9 +283,11 @@ public class Master {
         for (Integer reqId : failedRequests) {
             CompletableFuture<byte[]> future = pendingRequests.remove(reqId);
             if (future != null) {
-                System.out.println("[MASTER] Reassigning request " + reqId);
-                // Retry logic - redistribute to healthy workers
-                taskQueue.offer(new Task(reqId, new byte[0], future));
+                System.out.println("[MASTER] Redistributing request " + reqId + " after worker failure");
+                // Create new task with retry depth tracking
+                Task retryTask = new Task(reqId, new byte[0], future);
+                retryTask.retryCount = 1; // First retry attempt
+                taskQueue.offer(retryTask);
             }
         }
     }
